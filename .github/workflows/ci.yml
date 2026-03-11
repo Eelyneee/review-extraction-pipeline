@@ -6,12 +6,19 @@ on:
   pull_request:
     branches: [ main ]
 
+env:
+  AWS_REGION: ap-southeast-1
+  ECR_REPOSITORY: hawker-nlp
+  ECS_CLUSTER: hawker-nlp-cluster
+  ECS_SERVICE: hawker-nlp-service
+  CONTAINER_NAME: hawker-nlp
+
 jobs:
-  build-and-test:
+  build-test-deploy:
     runs-on: ubuntu-latest
 
     steps:
-      # Step 1: Checkout code (with LFS for model files)
+      # Step 1: Checkout code with LFS
       - name: Checkout code
         uses: actions/checkout@v4
         with:
@@ -20,28 +27,53 @@ jobs:
       - name: Pull LFS model files
         run: git lfs pull
 
-      # Step 2: Build Docker image
-      - name: Build Docker image
-        run: docker build -t hawker-nlp .
+      # Step 2: Configure AWS credentials
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      # Step 3: Run container in background
-      - name: Start container
+      # Step 3: Login to ECR
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Step 4: Build and push image to ECR (native amd64, no emulation)
+      - name: Build and push Docker image to ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      # Step 5: Run container and test locally before deploying
+      - name: Start container for testing
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
           docker run -d \
             -p 8000:8000 \
             --name hawker_api \
-            hawker-nlp
+            $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           echo "Waiting for container to be ready..."
           sleep 15
 
-      # Step 4: Health check test
+      # Step 6: Health check test
       - name: Test health check endpoint
         run: |
           response=$(curl -s http://localhost:8000/)
           echo "Response: $response"
           echo $response | grep -q '"running"' && echo "✅ Health check passed" || (echo "❌ Health check failed" && exit 1)
 
-      # Step 5: Test analyze endpoint
+      # Step 7: Test analyze endpoint
       - name: Test analyze endpoint
         run: |
           response=$(curl -s -X POST http://localhost:8000/analyze \
@@ -50,14 +82,35 @@ jobs:
           echo "Response: $response"
           echo $response | grep -q '"revisit_intent"' && echo "✅ Analyze endpoint passed" || (echo "❌ Analyze endpoint failed" && exit 1)
 
-      # Step 6: Print container logs (useful for debugging)
+      # Step 8: Print logs (for debugging)
       - name: Print container logs
         if: always()
         run: docker logs hawker_api
 
-      # Step 7: Cleanup
-      - name: Cleanup
+      # Step 9: Cleanup test container
+      - name: Cleanup test container
         if: always()
         run: |
           docker stop hawker_api
           docker rm hawker_api
+
+      # Step 10: Deploy to ECS (only on push to main, not PRs)
+      - name: Deploy to ECS
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
+          echo "✅ Deployment triggered on ECS"
+
+      # Step 11: Wait for ECS to stabilize
+      - name: Wait for ECS deployment to complete
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --region ${{ env.AWS_REGION }}
+          echo "✅ ECS service is stable and running"
