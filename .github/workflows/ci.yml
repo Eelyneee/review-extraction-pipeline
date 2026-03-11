@@ -1,0 +1,63 @@
+name: Hawker NLP CI/CD
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Checkout code (with LFS for model files)
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Pull LFS model files
+        run: git lfs pull
+
+      # Step 2: Build Docker image
+      - name: Build Docker image
+        run: docker build -t hawker-nlp .
+
+      # Step 3: Run container in background
+      - name: Start container
+        run: |
+          docker run -d \
+            -p 8000:8000 \
+            --name hawker_api \
+            hawker-nlp
+          echo "Waiting for container to be ready..."
+          sleep 15
+
+      # Step 4: Health check test
+      - name: Test health check endpoint
+        run: |
+          response=$(curl -s http://localhost:8000/)
+          echo "Response: $response"
+          echo $response | grep -q '"running"' && echo "✅ Health check passed" || (echo "❌ Health check failed" && exit 1)
+
+      # Step 5: Test analyze endpoint
+      - name: Test analyze endpoint
+        run: |
+          response=$(curl -s -X POST http://localhost:8000/analyze \
+            -H "Content-Type: application/json" \
+            -d '{"review": "the chicken rice is amazing, will definitely come back"}')
+          echo "Response: $response"
+          echo $response | grep -q '"revisit_intent"' && echo "✅ Analyze endpoint passed" || (echo "❌ Analyze endpoint failed" && exit 1)
+
+      # Step 6: Print container logs (useful for debugging)
+      - name: Print container logs
+        if: always()
+        run: docker logs hawker_api
+
+      # Step 7: Cleanup
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop hawker_api
+          docker rm hawker_api
