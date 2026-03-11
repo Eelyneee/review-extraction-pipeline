@@ -3,4 +3,4 @@
 __pycache__/
 *.pyc
 *.pth
-app/model/
+# app/model/
